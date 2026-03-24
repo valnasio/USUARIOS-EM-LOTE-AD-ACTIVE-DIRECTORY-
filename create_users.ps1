@@ -1,148 +1,120 @@
-<#
-SCRIPT: Criação de usuários no Active Directory via CSV
+# Caminhos e domínio
+$csvFilePath = Join-Path -Path $PSScriptRoot -ChildPath "usuarios.csv"
+$ouPath = "OU=Usuarios,DC=dominio,DC=local"
+$domain = "dominio.local"
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$errorReportPath = Join-Path -Path $PSScriptRoot -ChildPath ("erros_{0}.csv" -f $timestamp)
 
-Este script cria usuários no AD utilizando um arquivo CSV.
-Ele foi feito de forma genérica para permitir adaptação fácil
-para diferentes estruturas de arquivos.
-
-Deve ser rodado no servidor que comtém o serviço do AD
-
-ANTES DE EXECUTAR:
-- Ajuste as configurações na seção CONFIGURAÇÕES
-- Ajuste o mapeamento de colunas conforme seu CSV
-- Certifique-se de que o módulo ActiveDirectory está instalado
-
-Requer permissões para criar usuários no AD.
-#>
-
-# ================================
-# CONFIGURAÇÕES
-# ================================
-
-# Caminho do arquivo CSV de entrada
-# ALTERE conforme o local do seu arquivo
-$csvFilePath = "C:\AD.csv"
-
-# OU onde os usuários serão criados
-# ALTERE para a OU correta do seu domínio
-$ouPath = "OU=Usuarios,DC=DOMAIN,DC=corp"
-
-# Domínio usado para gerar o UserPrincipalName
-# ALTERE para seu domínio
-$domain = "DOMAIN.corp"
-
-# Caminho do relatório de erros
-# ALTERE se desejar salvar em outro local
-$errorReportPath = "C:\erros_criacao_ad.csv"
-
-
-# ================================
-# MAPEAMENTO DE COLUNAS DO CSV
-# ================================
-# Aqui você define quais colunas do CSV correspondem
-# aos campos utilizados pelo script.
-
+# Mapeamento de colunas
 $csvMapping = @{
-    LoginColumn    = "RA"      # coluna que contém o login
-    NameColumn     = "NOME"    # coluna que contém o nome completo
-    PasswordColumn = "CPF"     # coluna que contém a senha inicial
+    NameColumn     = "NOME"
+    PasswordColumn = "DOCUMENTO"
 }
 
-
-# ================================
-# VALIDAÇÃO INICIAL
-# ================================
-
+# Verifica existência do CSV
 if (!(Test-Path $csvFilePath)) {
     Write-Error "Arquivo CSV não encontrado: $csvFilePath"
     exit
 }
 
-# Verificar se o módulo AD está disponível
+# Verifica módulo Active Directory
 if (!(Get-Module -ListAvailable -Name ActiveDirectory)) {
-    Write-Error "O módulo ActiveDirectory não está instalado."
+    Write-Error "Módulo ActiveDirectory não disponível"
     exit
 }
 
-
-# ================================
-# INICIALIZAÇÃO
-# ================================
-
+# Lista de erros
 $errors = @()
 
-# Carregar CSV
-$csvData = Import-Csv -Path $csvFilePath
+# Importa dados do CSV
+$csvData = Import-Csv -Path $csvFilePath -Delimiter ';'
 
+# Valida conteúdo do CSV
+if (!$csvData -or $csvData.Count -eq 0) {
+    Write-Warning "CSV vazio"
+    exit
+}
 
-# ================================
-# PROCESSAMENTO DOS USUÁRIOS
-# ================================
-
+# Processa registros do CSV
 foreach ($row in $csvData) {
+    $nomeCompleto = $row.($csvMapping.NameColumn)
+    $doc          = $row.($csvMapping.PasswordColumn)
 
-    # Obtém valores dinamicamente conforme mapeamento
-    $login = $row.($csvMapping.LoginColumn)
-    $nome  = $row.($csvMapping.NameColumn)
-    $senha = $row.($csvMapping.PasswordColumn)
-
-    # Validação básica
-    if ([string]::IsNullOrEmpty($login) -or [string]::IsNullOrEmpty($nome)) {
-
+    # Valida campos obrigatórios
+    if ([string]::IsNullOrEmpty($nomeCompleto) -or [string]::IsNullOrEmpty($doc)) {
         $errors += [PSCustomObject]@{
-            Login = $login
-            Nome  = $nome
-            Erro  = "Login ou nome vazio no CSV"
+            NomeCompleto = $nomeCompleto
+            Documento    = $doc
+            LoginGerado  = "N/A"
+            Erro         = "Dados obrigatórios ausentes"
         }
-
+        Write-Warning "Registro ignorado"
         continue
     }
 
-    # Parâmetros de criação do usuário
+    # Geração de login
+    $partesNome = $nomeCompleto.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+    $loginGerado = ""
+
+    if ($partesNome.Count -ge 2) {
+        $primeiroNome = $partesNome[0]
+        $ultimoSobrenome = $partesNome[-1]
+        $loginGerado = "$($primeiroNome.ToLower()).$($ultimoSobrenome.ToLower())"
+        $loginGerado = [System.Text.Encoding]::ASCII.GetString([System.Text.Encoding]::GetEncoding("Cyrillic").GetBytes($loginGerado))
+        $loginGerado = ($loginGerado -replace '[^a-zA-Z0-9\.]', '')
+    } elseif ($partesNome.Count -eq 1) {
+        $loginGerado = $partesNome[0].ToLower()
+        $loginGerado = [System.Text.Encoding]::ASCII.GetString([System.Text.Encoding]::GetEncoding("Cyrillic").GetBytes($loginGerado))
+        $loginGerado = ($loginGerado -replace '[^a-zA-Z0-9\.]', '')
+    } else {
+        $errors += [PSCustomObject]@{
+            NomeCompleto = $nomeCompleto
+            Documento    = $doc
+            LoginGerado  = "N/A"
+            Erro         = "Falha na geração de login"
+        }
+        Write-Warning "Registro inválido"
+        continue
+    }
+
+    # Define senha padrão
+    $senhaFinal = "Senha@$doc"
+
+    # Parâmetros do usuário
     $newUserParams = @{
-        Name              = $nome
-        DisplayName       = $nome
-        SamAccountName    = $login
-        UserPrincipalName = "$login@$domain"
-        AccountPassword   = (ConvertTo-SecureString $senha -AsPlainText -Force)
-        Enabled           = $true
-        Path              = $ouPath
+        Name                  = $nomeCompleto
+        DisplayName           = $nomeCompleto
+        SamAccountName        = $loginGerado
+        UserPrincipalName     = "$loginGerado@$domain"
+        AccountPassword       = (ConvertTo-SecureString $senhaFinal -AsPlainText -Force)
+        Enabled               = $true
+        Path                  = $ouPath
+        ChangePasswordAtLogon = $true
     }
 
     try {
-
+        # Cria usuário no AD
         New-ADUser @newUserParams -ErrorAction Stop
-        Write-Host "Usuário criado: $login"
-
+        Write-Host "Usuário criado: $loginGerado" -ForegroundColor Green
     }
     catch {
-
+        # Registra erro na criação
         $errors += [PSCustomObject]@{
-            Login = $login
-            Nome  = $nome
-            Erro  = $_.Exception.Message
+            NomeCompleto = $nomeCompleto
+            Documento    = $doc
+            LoginGerado  = $loginGerado
+            Erro         = $_.Exception.Message
         }
-
+        Write-Error "Erro ao criar usuário: $loginGerado"
     }
 }
 
-
-# ================================
-# RELATÓRIO FINAL
-# ================================
-
+# Gera relatório de erros
 if ($errors.Count -gt 0) {
-
     $errors | Export-Csv -Path $errorReportPath -NoTypeInformation -Encoding UTF8
-
-    Write-Host ""
-    Write-Host "Processo finalizado com erros."
-    Write-Host "Relatório salvo em: $errorReportPath"
-
+    Write-Host "Processo finalizado com erros" -ForegroundColor Yellow
+    Write-Host "Relatório: $errorReportPath" -ForegroundColor Yellow
 }
 else {
-
-    Write-Host ""
-    Write-Host "Processo finalizado sem erros."
-
+    Write-Host "Processo finalizado com sucesso" -ForegroundColor Green
 }
